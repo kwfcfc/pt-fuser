@@ -1,15 +1,19 @@
 // Crow CI workflow for pt-fuser.
 //
-// Build matrix: four AMD64 Linux distributions.
-// We do NOT add an architecture axis because every target is linux/amd64.
-// We DO build per-distro so each .so/binary is linked against the right
-// glibc / libclang / linux-libc-dev for that distro.
+// Build target: linux/amd64. We officially support Ubuntu 22.04, Ubuntu 24.04,
+// Debian 12, and Debian 13.
+//
+// Currently we only build on Ubuntu 22.04 (glibc 2.35) — the oldest of the
+// four targets. Because glibc is forward-compatible, a binary linked there
+// works on all of the newer targets. The other matrix rows are kept in this
+// file (commented out) so we can flip back to a per-distro build if we ever
+// need native packages (.deb/.rpm) tied to each release's package metadata.
 
 local distros = [
   { name: 'ubuntu-22.04', image: 'ubuntu:22.04' },
-  { name: 'ubuntu-24.04', image: 'ubuntu:24.04' },
-  { name: 'debian-12',    image: 'debian:bookworm' },
-  { name: 'debian-13',    image: 'debian:trixie' },
+  // { name: 'ubuntu-24.04', image: 'ubuntu:24.04' },
+  // { name: 'debian-12',    image: 'debian:bookworm' },
+  // { name: 'debian-13',    image: 'debian:trixie' },
 ];
 
 // Packages required by the workspace:
@@ -38,9 +42,21 @@ local installDeps = [
 // Edition 2024 requires rustc >= 1.85, which is newer than what Ubuntu 22.04
 // and Debian 12 ship. Use rustup with the latest stable toolchain instead of
 // the distro package.
+//
+// Some Crow agent backends mount /root as a named volume, so a half-finished
+// rustup from a previous run can leave a stale /root/.rustup that confuses
+// the next run (you will see "It looks like you have an existing rustup
+// settings file"). Wipe it before reinstalling.
+//
+// If the agent is on a slow link to static.rust-lang.org (typical for
+// China-hosted runners), uncomment the RUSTUP_*_SERVER lines to use the
+// USTC mirror — speeds the toolchain download up by 10-100x.
 local installRust = [
+  'rm -rf "$HOME/.rustup" "$HOME/.cargo"',
+  // 'export RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static',
+  // 'export RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup',
   "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs " +
-    '| sh -s -- -y --profile minimal --default-toolchain stable',
+    '| sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path',
   '. "$HOME/.cargo/env"',
   'rustc --version',
   'cargo --version',
