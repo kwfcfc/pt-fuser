@@ -102,6 +102,14 @@ local releaseUpload = [
     { event: ['manual', 'tag'] },
   ],
 
+  // Pin scheduling to linux/amd64 agents. Unlike step-level `when: platform:`
+  // (which silently filters the step out when it doesn't match), `labels:`
+  // is an agent-selection constraint: if no matching agent is available the
+  // pipeline stays pending instead of being aborted.
+  labels: {
+    platform: 'linux/amd64',
+  },
+
   // 4-way matrix, one entry per target distro. All AMD64.
   matrix: {
     include: [
@@ -118,7 +126,6 @@ local releaseUpload = [
     {
       name: 'build-${NAME}',
       image: '${IMAGE}',
-      when: [{ platform: 'linux/amd64' }],
       environment: {
         CARGO_TERM_COLOR: 'always',
         RUST_BACKTRACE: '1',
