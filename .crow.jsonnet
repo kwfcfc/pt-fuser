@@ -91,7 +91,10 @@ local releaseUpload = [
 ];
 
 {
-  name: 'pt-fuser build (${NAME})',
+  // The top-level workflow name is registered BEFORE matrix expansion, so
+  // ${NAME} would not be substituted here — Crow's UI auto-labels each
+  // matrix variant with its `NAME` value as a sub-row instead.
+  name: 'pt-fuser build',
 
   // Only run on manual dispatch or when a tag is pushed.
   // Push/PR events do NOT trigger this workflow.
