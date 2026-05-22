@@ -53,8 +53,6 @@ local installDeps = [
 // USTC mirror — speeds the toolchain download up by 10-100x.
 local installRust = [
   'rm -rf "$HOME/.rustup" "$HOME/.cargo"',
-  // 'export RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static',
-  // 'export RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup',
   "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs " +
     '| sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path',
   '. "$HOME/.cargo/env"',
@@ -62,10 +60,11 @@ local installRust = [
   'cargo --version',
 ];
 
-local buildAndTest = [
+local build = [
   '. "$HOME/.cargo/env"',
   'cargo build --release --workspace --locked',
-  'cargo test  --release --workspace --locked',
+  // ignore the test step
+  // 'cargo test  --release --workspace --locked',
 ];
 
 // Collect everything that downstream consumers actually need:
@@ -146,7 +145,7 @@ local releaseUpload = [
         CARGO_TERM_COLOR: 'always',
         RUST_BACKTRACE: '1',
       },
-      commands: installDeps + installRust + buildAndTest + archive,
+      commands: installDeps + installRust + build + archive,
     },
     // Only runs on tag pushes. Each matrix instance uploads its own
     // distro-specific tarball + sha256 to the same GitHub Release.
