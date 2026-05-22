@@ -85,6 +85,11 @@ local archive = [
 // awscli's bundled-Python install.
 local s5cmdVersion = '2.3.0';
 local uploadToR2 = [
+  // pipefail: without this, tar failing inside `tar | zstd` is silently
+  // ignored (zstd happily writes an empty 13B frame) and we ship a corrupt
+  // archive while the step reports green.
+  'set -eu -o pipefail',
+
   'apk add --no-cache curl ca-certificates tar zstd',
   'curl -fsSL "https://github.com/peak/s5cmd/releases/download/v' + s5cmdVersion +
     '/s5cmd_' + s5cmdVersion + '_Linux-64bit.tar.gz" -o /tmp/s5cmd.tgz',
@@ -123,6 +128,7 @@ local installGh = [
 // gets there first wins; the others get a 422 "already_exists" and we
 // swallow it. All instances then upload their own tarball with --clobber.
 local releaseUpload = [
+  'set -eu -o pipefail',
   'TAG="${CI_COMMIT_TAG}"',
   'TARBALL="pt-fuser-${TAG}-${TARGET}-linux-amd64.tar.zst"',
   'tar -C artifacts -cf - "${TARGET}" | zstd -T0 -19 -f -o "$TARBALL"',
