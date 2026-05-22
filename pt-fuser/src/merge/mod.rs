@@ -9,8 +9,9 @@ use std::{
 use tracing::{info, warn};
 
 use crate::trace::{
-    Chunk, Event, Frame, Trace, TraceError,
+    Chunk, Event, Frame, Trace,
     metrics::{Metrics, MetricsRange},
+    trace_error,
 };
 
 const FREQUENT_FRAME_THRESH: f32 = 0.7;
@@ -77,29 +78,40 @@ pub fn merge_traces(traces: &[&Trace]) -> Trace {
         .collect::<Vec<&Frame>>();
 
     info!("Merging frames for {} traces...", traces.len());
+
+    let new_end = frames
+        .iter()
+        .map(|f| f.metrics.end - f.metrics.start)
+        .sum::<Metrics>()
+        / (frames.len() as u64);
+    let mut new_root = Frame::new(
+        MetricsRange::new(Metrics::constant(0), new_end),
+        traces[0].root_frame().symbol.clone(),
+    );
+
     let mut lost_frame_occurences = Vec::new();
-    let merged_frame = merge_frames(
+    merge_children(
+        &mut new_root,
         &frames,
-        Metrics::constant(0),
         &mut lost_frame_occurences,
         FREQUENT_FRAME_THRESH,
     );
     lost_frame_occurences.sort();
     info!("Merging events...");
-    let mut merged_events = merge_events(traces, merged_frame.metrics);
+    let mut merged_events = merge_events(traces, &new_root.metrics);
 
     if !lost_frame_occurences.is_empty() {
         let lost_frame_event = Event::from_occurences(
-            TraceError::LostFrameWhileMerging as u32,
-            "Lost Frames".to_string(),
-            "A frame could not be added because it overlapped with adjacent frames.".to_string(),
+            trace_error::LostFrameWhileMerging::ID,
+            trace_error::LostFrameWhileMerging::NAME.to_string(),
+            trace_error::LostFrameWhileMerging::DESC.to_string(),
             lost_frame_occurences,
         )
         .expect("Failed to create lost frame event");
         merged_events.push(lost_frame_event);
     }
 
-    let result = Trace::new(merged_frame, merged_events);
+    let result = Trace::new(new_root, merged_events);
 
     result
 }
@@ -323,32 +335,50 @@ fn add_within_bounds(
     } else {
         warn!(
             "At {}, Merged child frame {} couldn't be added to parent {}",
-            original_child_start, child.symbol, frame.symbol
+            original_child_start, child, frame
         );
         lost_frame_occurrences.push(original_child_start);
     }
 }
 
-fn merge_frames(
-    frames: &[&Frame],
-    new_start: Metrics,
+fn merge_child_recursively(
+    new_parent: &mut Frame,
+    to_merge: &[&Frame],
+    offset_in_parent_sum: Metrics,
+    frequent_thresh: f32,
+    lost_frame_occurrences: &mut Vec<Metrics>,
+) -> Frame {
+    let new_start = new_parent.metrics.start + offset_in_parent_sum / (to_merge.len() as u64);
+    let new_end = new_start
+        + to_merge
+            .iter()
+            .map(|f| f.metrics.end - f.metrics.start)
+            .sum::<Metrics>()
+            / (to_merge.len() as u64);
+    let mut merged = Frame::new(
+        MetricsRange::new(new_start, new_end),
+        to_merge[0].symbol.clone(),
+    );
+
+    merge_children(
+        &mut merged,
+        &to_merge,
+        lost_frame_occurrences,
+        frequent_thresh,
+    );
+    merged
+}
+
+fn merge_children(
+    new_parent: &mut Frame,
+    children: &[&Frame],
     lost_frame_occurrences: &mut Vec<Metrics>,
     frequent_thresh: f32,
-) -> Frame {
-    let avg_len = frames
-        .iter()
-        .map(|f| &f.metrics.end - &f.metrics.start)
-        .sum::<Metrics>()
-        / (frames.len() as u64);
-    let new_end = new_start + avg_len;
-    let mut merged_parent = Frame::new(
-        MetricsRange::new(new_start, new_end),
-        frames[0].symbol.clone(),
-    );
-    let mut min_metrics = merged_parent.metrics.start;
-    let max_metrics = merged_parent.metrics.end;
+) {
+    let mut min_metrics = new_parent.metrics.start;
+    let max_metrics = new_parent.metrics.end;
 
-    let (n, indexed_children) = index_children(frames);
+    let (n, indexed_children) = index_children(children);
     let mut sequences = indexed_children
         .iter()
         .map(|c| c.as_slice())
@@ -391,15 +421,15 @@ fn merge_frames(
                 }
             }
 
-            let avg_freq_offset = freq_offset_sum / (freq_frames.len() as u64);
-            let merged_freq_frame = merge_frames(
+            let merged_freq_frame = merge_child_recursively(
+                new_parent,
                 &freq_frames,
-                new_start + avg_freq_offset,
-                lost_frame_occurrences,
+                freq_offset_sum,
                 frequent_thresh,
+                lost_frame_occurrences,
             );
             add_within_bounds(
-                &mut merged_parent,
+                new_parent,
                 merged_freq_frame,
                 &mut min_metrics,
                 &max_metrics,
@@ -407,15 +437,15 @@ fn merge_frames(
             );
         }
 
-        let avg_common_offset = common_offset_sum / (common_frames.len() as u64);
-        let merged_common_frame = merge_frames(
+        let merged_common_frame = merge_child_recursively(
+            new_parent,
             &common_frames,
-            new_start + avg_common_offset,
-            lost_frame_occurrences,
+            common_offset_sum,
             frequent_thresh,
+            lost_frame_occurrences,
         );
         add_within_bounds(
-            &mut merged_parent,
+            new_parent,
             merged_common_frame,
             &mut min_metrics,
             &max_metrics,
@@ -439,23 +469,21 @@ fn merge_frames(
             }
         }
 
-        let avg_freq_offset = freq_offset_sum / (freq_frames.len() as u64);
-        let merged_freq_frame = merge_frames(
+        let merged_freq_frame = merge_child_recursively(
+            new_parent,
             &freq_frames,
-            new_start + avg_freq_offset,
-            lost_frame_occurrences,
+            freq_offset_sum,
             frequent_thresh,
+            lost_frame_occurrences,
         );
         add_within_bounds(
-            &mut merged_parent,
+            new_parent,
             merged_freq_frame,
             &mut min_metrics,
             &max_metrics,
             lost_frame_occurrences,
         );
     }
-
-    merged_parent
 }
 
 fn zip_events(
@@ -498,7 +526,7 @@ fn zip_events(
         .expect("Failed to create merged Event")
 }
 
-fn merge_events(traces: &[&Trace], new_range: MetricsRange) -> Vec<Event> {
+fn merge_events(traces: &[&Trace], new_range: &MetricsRange) -> Vec<Event> {
     let new_range_len = new_range.end - new_range.start;
     let mut events = Vec::new();
     let mut seen_ids = HashSet::new();

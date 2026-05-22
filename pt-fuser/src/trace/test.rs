@@ -75,21 +75,24 @@ fn test_trace() -> Trace {
 
 #[test]
 fn range_totals() {
-    let frame = Chunk::Frame(Frame::new(SAMPLE_RANGE, TEST_SYMBOL.clone()));
+    let chunk = Chunk::Frame(Frame::new(SAMPLE_RANGE, TEST_SYMBOL.clone()));
     assert_eq!(SAMPLE_RANGE.total_time(), 100);
     assert_eq!(SAMPLE_RANGE.total_cycles(), 300);
     assert_eq!(SAMPLE_RANGE.total_insn(), 800);
-    assert_eq!(frame.total_time(), SAMPLE_RANGE.total_time());
-    assert_eq!(frame.total_cycles(), SAMPLE_RANGE.total_cycles());
-    assert_eq!(frame.total_insn(), SAMPLE_RANGE.total_insn());
+    assert_eq!(chunk.metrics().total_time(), SAMPLE_RANGE.total_time());
+    assert_eq!(chunk.metrics().total_cycles(), SAMPLE_RANGE.total_cycles());
+    assert_eq!(chunk.metrics().total_insn(), SAMPLE_RANGE.total_insn());
 }
 
 #[test]
 fn zero_duration_frame() {
-    let frame = MetricsRange::new(SAMPLE_RANGE.start, SAMPLE_RANGE.start);
-    assert_eq!(frame.total_time(), 0);
-    assert_eq!(frame.total_cycles(), 0);
-    assert_eq!(frame.total_insn(), 0);
+    let chunk = Chunk::Frame(Frame::new(
+        MetricsRange::new(SAMPLE_RANGE.start, SAMPLE_RANGE.start),
+        TEST_SYMBOL.clone(),
+    ));
+    assert_eq!(chunk.metrics().total_time(), 0);
+    assert_eq!(chunk.metrics().total_cycles(), 0);
+    assert_eq!(chunk.metrics().total_insn(), 0);
 }
 
 #[test]
@@ -102,10 +105,10 @@ fn empty_frame_invariant() {
 fn fails_invariant() {
     let mut frame = Frame::new(SAMPLE_RANGE, TEST_SYMBOL.clone());
     match &mut frame.chunks[0] {
-        Chunk::Frame(_) => unreachable!(),
         Chunk::Straightline(straightline) => {
-            straightline.metrics.end -= METRICS_ONE;
+            straightline.end -= METRICS_ONE;
         }
+        _ => unreachable!(),
     }
     assert!(!frame.check_invariant());
 }
@@ -125,7 +128,7 @@ fn child_overlaps_parent() {
     let mut outer = Frame::new(SAMPLE_RANGE, TEST_SYMBOL.clone());
     let inner = Frame::new(SAMPLE_RANGE, TEST_SYMBOL.clone());
     outer.add_child(inner).unwrap();
-    assert_eq!(outer.chunks.len(), 1);
+    assert_eq!(outer.chunks().len(), 1);
     assert!(outer.check_invariant());
 }
 
@@ -133,13 +136,13 @@ fn child_overlaps_parent() {
 fn child_overlapping_complex() {
     let trace = test_trace();
     let outer = trace.root_frame();
-    assert_eq!(outer.chunks.len(), 5);
+    assert_eq!(outer.chunks().len(), 5);
     assert!(outer.check_invariant());
-    assert!(matches!(&outer.chunks[0], Chunk::Frame(_)));
-    assert!(matches!(&outer.chunks[1], Chunk::Straightline(_)));
-    assert!(matches!(&outer.chunks[2], Chunk::Frame(_)));
-    assert!(matches!(&outer.chunks[3], Chunk::Straightline(_)));
-    assert!(matches!(&outer.chunks[4], Chunk::Frame(_)));
+    assert!(matches!(&outer.chunks()[0], Chunk::Frame(_)));
+    assert!(matches!(&outer.chunks()[1], Chunk::Straightline(_)));
+    assert!(matches!(&outer.chunks()[2], Chunk::Frame(_)));
+    assert!(matches!(&outer.chunks()[3], Chunk::Straightline(_)));
+    assert!(matches!(&outer.chunks()[4], Chunk::Frame(_)));
 }
 
 #[test]
@@ -339,7 +342,7 @@ fn serialize_round_trip_nogzip() {
     let data = trace.bin_serialize(false).unwrap();
     let deserialized = Trace::bin_deserialize(&data, false).unwrap();
 
-    assert_eq!(deserialized.root_frame().chunks.len(), 5);
+    assert_eq!(deserialized.root_frame().chunks().len(), 5);
     assert!(deserialized.root_frame().check_invariant());
 }
 
@@ -349,6 +352,6 @@ fn serialize_round_trip_gzip() {
     let data = trace.bin_serialize(true).unwrap();
     let deserialized = Trace::bin_deserialize(&data, true).unwrap();
 
-    assert_eq!(deserialized.root_frame().chunks.len(), 5);
+    assert_eq!(deserialized.root_frame().chunks().len(), 5);
     assert!(deserialized.root_frame().check_invariant());
 }

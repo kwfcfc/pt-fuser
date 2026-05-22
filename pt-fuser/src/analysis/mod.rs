@@ -3,22 +3,22 @@ pub mod histogram;
 
 use crate::trace::{Chunk, Frame};
 
-pub struct FrameFinder<'a, 'b, F>
+pub struct FrameFinder<'a, 'b, P>
 where
-    F: Fn(&'a Frame) -> bool,
+    P: Fn(&Frame) -> bool,
 {
     curr_frame: &'a Frame,
     child_index: usize,
-    child_frame_finder: Option<Box<FrameFinder<'a, 'b, F>>>,
-    pred: &'b F,
+    child_frame_finder: Option<Box<FrameFinder<'a, 'b, P>>>,
+    pred: &'b P,
     produced_self: bool,
 }
 
-impl<'a, 'b, F> FrameFinder<'a, 'b, F>
+impl<'a, 'b, P> FrameFinder<'a, 'b, P>
 where
-    F: Fn(&'a Frame) -> bool,
+    P: Fn(&Frame) -> bool,
 {
-    pub fn new(root: &'a Frame, pred: &'b F) -> FrameFinder<'a, 'b, F> {
+    pub fn new(root: &'a Frame, pred: &'b P) -> FrameFinder<'a, 'b, P> {
         FrameFinder {
             curr_frame: root,
             child_index: 0,
@@ -29,9 +29,9 @@ where
     }
 }
 
-impl<'a, 'b, F> Iterator for FrameFinder<'a, 'b, F>
+impl<'a, 'b, P> Iterator for FrameFinder<'a, 'b, P>
 where
-    F: Fn(&'a Frame) -> bool,
+    P: Fn(&Frame) -> bool,
 {
     type Item = &'a Frame;
 

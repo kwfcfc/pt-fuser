@@ -123,7 +123,7 @@ impl Converter {
         }
     }
 
-    fn process_frame(&mut self, frame: &Frame) -> Vec<TracePacket> {
+    fn process_frame(&mut self, frame: &Frame, stack_iid: &mut Vec<u64>) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
         let mut intern_data = None;
@@ -150,12 +150,31 @@ impl Converter {
         slice_begin.interned_data = intern_data;
         packets.push(slice_begin);
 
+        stack_iid.push(iid);
+
         for chunk in frame.chunks() {
             match chunk {
-                Chunk::Frame(child) => packets.extend(self.process_frame(child)),
+                Chunk::Frame(child) => packets.extend(self.process_frame(child, stack_iid)),
                 Chunk::Straightline(_) => continue,
+                Chunk::Pause(metrics) => {
+                    // pretend all previous stack frames end here
+                    for _ in 0..stack_iid.len() {
+                        let slice_end = create_slice_end(metrics.start.ts);
+                        packets.push(slice_end);
+                    }
+
+                    // previous stack frames resume once pause is over
+                    // in Perfetto, this appears as a blank gap, indicating that tracing was paused
+                    let resume = metrics.end.ts;
+                    for iid in stack_iid.iter() {
+                        let slice_begin = create_slice_begin(resume, *iid);
+                        packets.push(slice_begin);
+                    }
+                }
             }
         }
+
+        stack_iid.pop();
 
         let slice_end = create_slice_end(frame.metrics.end.ts);
         packets.push(slice_end);
@@ -166,7 +185,7 @@ impl Converter {
 
 pub fn convert_to_perfetto(trace: &Trace) -> Vec<u8> {
     let mut converter = Converter::new();
-    let mut packets = converter.process_frame(trace.root_frame());
+    let mut packets = converter.process_frame(trace.root_frame(), &mut Vec::new());
 
     let trace_start = create_trace_track_start();
     packets.insert(0, trace_start);

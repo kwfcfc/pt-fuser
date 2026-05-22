@@ -5,15 +5,16 @@ use pt_fuser::{
         filter::{self, Filter},
         histogram::HistogramApp,
     },
-    trace::{Frame, Trace, TraceError},
+    trace::{Frame, Trace, trace_error},
 };
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use regex::Regex;
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
 enum Action {
-    Error,
+    Errors,
     Latency,
+    Interrupts,
 }
 
 #[derive(Parser)]
@@ -35,6 +36,45 @@ struct Cli {
     filter: Vec<Filter>,
     #[clap(help = "The pt-fuser trace files to analyze")]
     input_files: Vec<String>,
+}
+
+fn add_histogram_datapoint<'a>(
+    frames: impl IntoIterator<Item = &'a Frame>,
+    trace: &Trace,
+    data: &mut Vec<f64>,
+    action: &Action,
+) {
+    let error_event = match action {
+        Action::Errors => trace.get_event(trace_error::DataCollectionError::ID),
+        Action::Interrupts => trace.get_event(trace_error::TraceInterrupted::ID),
+        Action::Latency => None,
+    };
+
+    match action {
+        Action::Errors | Action::Interrupts => {
+            let Some(errors) = error_event else {
+                data.push(0f64);
+                return;
+            };
+            let errors = errors.occurences();
+            let mut error_index = 0;
+            let mut num_errors = 0;
+            for frame in frames {
+                while error_index < errors.len() && errors[error_index] < frame.metrics.end {
+                    if errors[error_index] >= frame.metrics.start {
+                        num_errors += 1;
+                    }
+                    error_index += 1;
+                }
+            }
+            data.push(num_errors as f64);
+        }
+        Action::Latency => {
+            for frame in frames {
+                data.push(frame.metrics.total_time() as f64);
+            }
+        }
+    }
 }
 
 fn main() -> eframe::Result<()> {
@@ -61,44 +101,27 @@ fn main() -> eframe::Result<()> {
 
     let mut data = Vec::new();
     for trace in &traces {
-        let pred = |f: &Frame| {
-            if let Some(regex) = &regex {
-                regex.is_match(&f.symbol.name)
-            } else {
-                f == trace.root_frame()
-            }
-        };
-        let frame_finder = FrameFinder::new(trace.root_frame(), &pred);
-        match cli.action {
-            Action::Error => {
-                let Some(errors) = trace.get_event(TraceError::DataCollectionError as u32) else {
-                    data.push(0f64);
-                    continue;
-                };
-                let errors = errors.occurences();
-                let mut error_index = 0;
-                let mut num_errors = 0;
-                for frame in frame_finder {
-                    while error_index < errors.len() && errors[error_index] < frame.metrics.end {
-                        if errors[error_index] >= frame.metrics.start {
-                            num_errors += 1;
-                        }
-                        error_index += 1;
-                    }
-                }
-                data.push(num_errors as f64);
-            }
-            Action::Latency => {
-                for frame in frame_finder {
-                    data.push(frame.metrics.total_time() as f64);
-                }
-            }
+        if let Some(regex) = &regex {
+            let pred = |f: &Frame| regex.is_match(&f.symbol.name);
+            add_histogram_datapoint(
+                FrameFinder::new(trace.root_frame(), &pred),
+                trace,
+                &mut data,
+                &cli.action,
+            );
+        } else {
+            add_histogram_datapoint(
+                std::iter::once(trace.root_frame()),
+                trace,
+                &mut data,
+                &cli.action,
+            );
         }
     }
 
     let options = eframe::NativeOptions::default();
     let app = match cli.action {
-        Action::Error => HistogramApp::new(
+        Action::Errors => HistogramApp::new(
             format!("Error Count Distribution of {} traces", traces.len()),
             &data,
             "Error Count".into(),
@@ -108,6 +131,12 @@ fn main() -> eframe::Result<()> {
             format!("Latency Distribution of {} traces", traces.len()),
             &data,
             "Latency (ns)".into(),
+            "Count".into(),
+        ),
+        Action::Interrupts => HistogramApp::new(
+            format!("Interrupt Count Distribution of {} traces", traces.len()),
+            &data,
+            "Interrupt Count".into(),
             "Count".into(),
         ),
     };
