@@ -123,6 +123,7 @@ local releaseUpload = [
   // pipeline stays pending instead of being aborted.
   labels: {
     platform: 'linux/amd64',
+    tier: 'local',
   },
 
   // 4-way matrix, one entry per target distro. All AMD64.
