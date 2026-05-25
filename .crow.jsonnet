@@ -87,65 +87,28 @@ local archive = [
   'ls -la artifacts/${TARGET}/',
 ];
 
-// Upload manually built result to Cloudflare R2 storage.
-// R2 speaks the S3 API but doesn't require the official AWS CLI — use
-// s5cmd, a static Go binary that works on Alpine and is ~5x smaller than
-// awscli's bundled-Python install.
-local s5cmdVersion = '2.3.0';
-local uploadToR2 = [
-  // pipefail: without this, tar failing inside `tar | zstd` is silently
-  // ignored (zstd happily writes an empty 13B frame) and we ship a corrupt
-  // archive while the step reports green.
+// Shared packaging — both the manual R2 upload and the tag-driven
+// GitHub Release step consume `dist/`. REF differs by event so manual
+// and tag builds can never collide on filename.
+//
+// pipefail: without this, tar failing inside `tar | zstd` is silently
+// ignored (zstd happily writes an empty 13B frame) and we ship a corrupt
+// archive while the step reports green.
+local package_ = [
   'set -eu -o pipefail',
+  'apk add --no-cache tar zstd',
 
-  'apk add --no-cache curl ca-certificates tar zstd',
-  'curl -fsSL "https://github.com/peak/s5cmd/releases/download/v' + s5cmdVersion +
-    '/s5cmd_' + s5cmdVersion + '_Linux-64bit.tar.gz" -o /tmp/s5cmd.tgz',
-  'tar -xzf /tmp/s5cmd.tgz -C /tmp s5cmd',
-  'install -m 0755 /tmp/s5cmd /usr/local/bin/s5cmd',
-  's5cmd version',
-
-  'SHORT_SHA="$(printf "%s" "$CI_COMMIT_SHA" | cut -c1-12)"',
-  'REF="manual-$CI_PIPELINE_NUMBER-$SHORT_SHA"',
+  'if [ "$CI_PIPELINE_EVENT" = "tag" ]; then',
+  '  REF="$CI_COMMIT_TAG"',
+  'else',
+  '  REF="manual-${CI_PIPELINE_NUMBER}-${CI_COMMIT_SHA_SHORT}"',
+  'fi',
 
   'TARBALL="pt-fuser-$REF-${TARGET}-linux-amd64.tar.zst"',
-  'tar -C artifacts -cf - "${TARGET}" | zstd -T0 -19 -f -o "$TARBALL"',
-  'sha256sum "$TARBALL" > "$TARBALL.sha256"',
-
-  'R2_PREFIX="pt-fuser/manual/$REF/${TARGET}"',
-
-  's5cmd --endpoint-url "$R2_ENDPOINT" cp "$TARBALL" "s3://$R2_BUCKET/$R2_PREFIX/$TARBALL"',
-  's5cmd --endpoint-url "$R2_ENDPOINT" cp "$TARBALL.sha256" "s3://$R2_BUCKET/$R2_PREFIX/$TARBALL.sha256"',
-
-  'echo "Uploaded artifact:"',
-  'echo "s3://$R2_BUCKET/$R2_PREFIX/$TARBALL"',
-];
-
-// Statically-linked gh CLI release; pure Go binary, runs on Alpine.
-local ghVersion = '2.92.0';
-local installGh = [
-  'apk add --no-cache curl ca-certificates tar zstd',
-  'curl -fsSL "https://github.com/cli/cli/releases/download/v' + ghVersion +
-    '/gh_' + ghVersion + '_linux_amd64.tar.gz" -o /tmp/gh.tgz',
-  'tar -xzf /tmp/gh.tgz -C /tmp',
-  'install -m 0755 "/tmp/gh_' + ghVersion + '_linux_amd64/bin/gh" /usr/local/bin/gh',
-  'gh --version',
-];
-
-// Race note: each matrix instance attempts `gh release create`. Whichever
-// gets there first wins; the others get a 422 "already_exists" and we
-// swallow it. All instances then upload their own tarball with --clobber.
-local releaseUpload = [
-  'set -eu -o pipefail',
-  'TAG="${CI_COMMIT_TAG}"',
-  'TARBALL="pt-fuser-${TAG}-${TARGET}-linux-amd64.tar.zst"',
-  'tar -C artifacts -cf - "${TARGET}" | zstd -T0 -19 -f -o "$TARBALL"',
-  'sha256sum "$TARBALL" > "$TARBALL.sha256"',
-  'gh release view "$TAG" --repo "$CI_REPO" >/dev/null 2>&1 || ' +
-    'gh release create "$TAG" --repo "$CI_REPO" ' +
-    '--title "$TAG" --notes "Automated release for $TAG" || true',
-  'gh release upload "$TAG" "$TARBALL" "$TARBALL.sha256" ' +
-    '--repo "$CI_REPO" --clobber',
+  'mkdir -p dist',
+  'tar -C artifacts -cf - "${TARGET}" | zstd -T0 -19 -f -o "dist/$TARBALL"',
+  '( cd dist && sha256sum "$TARBALL" > "$TARBALL.sha256" )',
+  'ls -la dist/',
 ];
 
 {
@@ -191,36 +154,51 @@ local releaseUpload = [
       },
       commands: installDeps + installRust + build + archive,
     },
+    // Shared packaging — produces dist/<tarball> + dist/<tarball>.sha256
+    // for both downstream upload steps. Small alpine image so the matrix
+    // doesn't pull 4 different ubuntu/debian images just to repackage.
+    {
+      name: 'package-${TARGET}',
+      image: 'alpine:3.23',
+      when: [{ event: ['manual', 'tag'] }],
+      commands: package_,
+    },
+    // Manual-only: push to Cloudflare R2 via the woodpecker s3 plugin.
+    // R2 is S3-compatible; `endpoint` + `region: auto` + `path_style` is
+    // the standard incantation.
     {
       name: 'r2-upload-${TARGET}',
-      // Upload-only step; doesn't need the build distro. Pinning to one
-      // small Alpine image means the matrix doesn't end up pulling 4
-      // different ubuntu/debian images just to repackage the artifacts.
-      image: 'alpine:3.23',
+      image: 'docker.io/woodpeckerci/plugin-s3',
       when: [{ event: 'manual' }],
-      environment: {
-        AWS_ACCESS_KEY_ID: { from_secret: 'r2_access_key_id' },
-        AWS_SECRET_ACCESS_KEY: { from_secret: 'r2_secret_access_key' },
-        AWS_DEFAULT_REGION: 'auto',
-        AWS_EC2_METADATA_DISABLED: 'true',
-
-        R2_ENDPOINT: { from_secret: 'r2_endpoint' },
-        R2_BUCKET: { from_secret: 'r2_bucket' },
+      settings: {
+        endpoint: { from_secret: 'r2_endpoint' },
+        access_key: { from_secret: 'r2_access_key_id' },
+        secret_key: { from_secret: 'r2_secret_access_key' },
+        bucket: { from_secret: 'r2_bucket' },
+        region: 'auto',
+        path_style: true,
+        source: 'dist/*',
+        strip_prefix: 'dist/',
+        target: '/pt-fuser/manual/${CI_PIPELINE_NUMBER}-${CI_COMMIT_SHA_SHORT}/${TARGET}/',
       },
-      commands: uploadToR2,
     },
     // Only runs on tag pushes. Each matrix instance uploads its own
     // distro-specific tarball + sha256 to the same GitHub Release.
+    // The release plugin is idempotent on the tag (no view-or-create
+    // race like the old gh-cli flow), and `file-exists` defaults to
+    // overwrite — equivalent to `gh release upload --clobber`.
     // Requires a Crow secret named `github_token` with a PAT that has
     // `contents: write` on the target repo.
     {
       name: 'release-${NAME}',
-      image: 'alpine:3.23',
+      image: 'docker.io/woodpeckerci/plugin-release',
       when: [{ event: 'tag' }],
-      environment: {
-        GH_TOKEN: { from_secret: 'github_token' },
+      settings: {
+        api_key: { from_secret: 'github_token' },
+        files: ['dist/*'],
+        title: '${CI_COMMIT_TAG}',
+        note: 'Automated release for ${CI_COMMIT_TAG} from Crow CI',
       },
-      commands: installGh + releaseUpload,
     },
   ],
 }
