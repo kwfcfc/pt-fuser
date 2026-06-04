@@ -101,7 +101,7 @@ local package_ = [
   'if [ "$CI_PIPELINE_EVENT" = "tag" ]; then',
   '  REF="$CI_COMMIT_TAG"',
   'else',
-  '  REF="manual-${CI_PIPELINE_NUMBER}-${CI_COMMIT_SHA_SHORT}"',
+  '  REF="manual-${CI_PIPELINE_NUMBER}-${CI_COMMIT_SHA:0:8}"',
   'fi',
 
   'TARBALL="pt-fuser-$REF-${TARGET}-linux-amd64.tar.zst"',
@@ -179,7 +179,7 @@ local package_ = [
         path_style: true,
         source: 'dist/*',
         strip_prefix: 'dist/',
-        target: '/pt-fuser/manual/${CI_PIPELINE_NUMBER}-${CI_COMMIT_SHA_SHORT}/${TARGET}/',
+        target: '/pt-fuser/manual/${CI_PIPELINE_NUMBER}-${CI_COMMIT_SHA:0:8}/${TARGET}/',
       },
     },
     // Only runs on tag pushes. Each matrix instance uploads its own
