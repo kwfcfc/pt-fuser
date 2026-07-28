@@ -22,6 +22,12 @@ const FREQUENT_FRAME_THRESH: f32 = 0.7;
 const ANNOTATION_COUNT_NAME: &str = "Merging Count";
 const ANNOTATION_STATS_NAME: &str = "Merging Stats";
 const ANNOTATION_RAW_DATA_NAME: &str = "Merging Raw Latencies";
+const ANNOTATION_NOISE_CONTRIBUTION_NAME: &str = "Noise Contribution (NC)";
+
+struct NoiseContext<'a> {
+    e2e_latencies: &'a [Metrics],
+    e2e_stddev: f64,
+}
 
 /// # Merging Algorithm
 ///
@@ -81,7 +87,11 @@ pub fn merge_traces(traces: &[&Trace], raw_trace_ids: Option<&[&str]>) -> Trace 
     if traces.is_empty() {
         panic!("Cannot merge empty list of traces");
     } else if raw_trace_ids.is_some() && raw_trace_ids.unwrap().len() != traces.len() {
-        panic!("Found {} traces but {} trace_ids", traces.len(), raw_trace_ids.unwrap().len());
+        panic!(
+            "Found {} traces but {} trace_ids",
+            traces.len(),
+            raw_trace_ids.unwrap().len()
+        );
     } else if traces.len() == 1 {
         return traces[0].clone();
     }
@@ -97,19 +107,34 @@ pub fn merge_traces(traces: &[&Trace], raw_trace_ids: Option<&[&str]>) -> Trace 
         .iter()
         .map(|f| f.metrics.end - f.metrics.start)
         .collect::<Vec<_>>();
+    let noise_context = Stats::from_data(latencies.iter().map(|latency| latency.ts as f64))
+        .filter(|stats| stats.stddev > 0.0)
+        .map(|stats| NoiseContext {
+            e2e_latencies: &latencies,
+            e2e_stddev: stats.stddev,
+        });
+    let trace_indices = (0..traces.len()).collect::<Vec<_>>();
     let new_end = latencies.iter().sum::<Metrics>() / (frames.len() as u64);
     let mut new_root = Frame::new(
         MetricsRange::new(Metrics::constant(0), new_end),
         traces[0].root_frame().symbol.clone(),
     );
 
-    fill_annotations(&mut new_root, &latencies, raw_trace_ids);
+    fill_annotations(
+        &mut new_root,
+        &latencies,
+        raw_trace_ids,
+        &trace_indices,
+        noise_context.as_ref(),
+    );
 
     let mut lost_frame_occurences = Vec::new();
     merge_children(
         &mut new_root,
         &frames,
         raw_trace_ids,
+        &trace_indices,
+        noise_context.as_ref(),
         &mut lost_frame_occurences,
         FREQUENT_FRAME_THRESH,
     );
@@ -138,6 +163,7 @@ trait Id: Clone {
 #[derive(Clone, Copy)]
 struct FrameIndexed<'a, 'b> {
     raw_trace_id: Option<&'b str>,
+    trace_index: usize,
     original: &'a Frame,
     offset_in_parent: Metrics,
     // unique within a parent frame, stable across parent frames
@@ -200,7 +226,16 @@ struct IdMapKey<'a> {
 fn index_children<'a, 'b>(
     frames: &[&'a Frame],
     trace_ids: Option<&'b [&str]>,
+    trace_indices: &[usize],
 ) -> (u32, Vec<Vec<IndexedChild<'a, 'b>>>) {
+    if frames.len() != trace_indices.len() {
+        panic!(
+            "Found {} frames but {} trace indices",
+            frames.len(),
+            trace_indices.len()
+        );
+    }
+
     let mut indexed_children = Vec::with_capacity(frames.len());
     let mut symbol_ids: HashMap<IdMapKey, u32> = HashMap::new();
     let mut next_id = 0;
@@ -230,6 +265,7 @@ fn index_children<'a, 'b>(
 
                     children.push(IndexedChild::Frame(FrameIndexed {
                         raw_trace_id: trace_id,
+                        trace_index: trace_indices[i],
                         original: frame,
                         offset_in_parent: frame.metrics.start - parent.metrics.start,
                         id: *id,
@@ -390,17 +426,33 @@ fn find_frequent_children<I: Id>(
     }
 }
 
-fn fill_annotations(frame: &mut Frame, latencies: &[Metrics], trace_ids: Option<&[&str]>) {
+fn fill_annotations(
+    frame: &mut Frame,
+    latencies: &[Metrics],
+    trace_ids: Option<&[&str]>,
+    trace_indices: &[usize],
+    noise_context: Option<&NoiseContext>,
+) {
     frame.annotations.insert(
         ANNOTATION_COUNT_NAME.to_string(),
         Annotation::Uint64(latencies.len() as u64),
     );
     let ts_latencies = latencies.iter().map(|l| l.ts as f64);
-    if let Some(stats) = Stats::from_data(ts_latencies) {
-        let stats = stats
+    let mut stats_annotation = Stats::from_data(ts_latencies).map(|stats| {
+        stats
             .into_iter()
             .map(|(k, v)| (k, Annotation::Double(v)))
-            .collect::<IndexMap<String, Annotation>>();
+            .collect::<IndexMap<String, Annotation>>()
+    });
+
+    if let Some(noise_contribution) = noise_contribution(latencies, trace_indices, noise_context) {
+        stats_annotation.get_or_insert_with(IndexMap::new).insert(
+            ANNOTATION_NOISE_CONTRIBUTION_NAME.to_string(),
+            Annotation::Double(noise_contribution),
+        );
+    }
+
+    if let Some(stats) = stats_annotation {
         frame
             .annotations
             .insert(ANNOTATION_STATS_NAME.to_string(), Annotation::Map(stats));
@@ -421,6 +473,41 @@ fn fill_annotations(frame: &mut Frame, latencies: &[Metrics], trace_ids: Option<
             Annotation::Map(raw_data_map),
         );
     }
+}
+
+fn noise_contribution(
+    latencies: &[Metrics],
+    trace_indices: &[usize],
+    noise_context: Option<&NoiseContext>,
+) -> Option<f64> {
+    let noise_context = noise_context?;
+    if latencies.len() != trace_indices.len() {
+        panic!(
+            "Found {} latencies but {} trace indices",
+            latencies.len(),
+            trace_indices.len()
+        );
+    }
+
+    // A frame that did not occur in a trace already completes instantaneously in that trace,
+    // so its latency is zero rather than a reason to remove the trace from the population.
+    let mut frame_latencies = vec![0.0; noise_context.e2e_latencies.len()];
+    for (latency, &trace_index) in latencies.iter().zip(trace_indices) {
+        let frame_latency = frame_latencies
+            .get_mut(trace_index)
+            .expect("Trace index should refer to an end-to-end latency");
+        *frame_latency = latency.ts as f64;
+    }
+
+    let latency_without_frame = noise_context
+        .e2e_latencies
+        .iter()
+        .zip(frame_latencies)
+        .map(|(e2e, frame)| e2e.ts as f64 - frame);
+    let stddev_without_frame = Stats::from_data(latency_without_frame)?.stddev;
+
+    // NC(A) = (SD(LE2E) - SD(LE2E - LA)) / SD(LE2E).
+    Some(1.0 - stddev_without_frame / noise_context.e2e_stddev)
 }
 
 fn constrain_metrics(
@@ -449,13 +536,15 @@ fn merge_children(
     new_parent: &mut Frame,
     frames: &[&Frame],
     raw_trace_ids: Option<&[&str]>, // parallel list to frames
+    trace_indices: &[usize],        // parallel list to frames
+    noise_context: Option<&NoiseContext>,
     lost_frame_occurrences: &mut Vec<Metrics>,
     frequent_thresh: f32,
 ) {
     let mut min_metrics = new_parent.metrics.start;
     let max_metrics = new_parent.metrics.end;
 
-    let (n, indexed_children) = index_children(frames, raw_trace_ids);
+    let (n, indexed_children) = index_children(frames, raw_trace_ids, trace_indices);
     let mut sequences = indexed_children
         .iter()
         .map(|c| c.as_slice())
@@ -501,6 +590,15 @@ fn merge_children(
                                 .collect::<Vec<&str>>(),
                         );
                     }
+                    let active_trace_indices = children
+                        .iter()
+                        .map(|c| match c {
+                            IndexedChild::Frame(f) => f.trace_index,
+                            IndexedChild::Pause(_) => {
+                                panic!("Expected all children to be Frame chunks")
+                            }
+                        })
+                        .collect::<Vec<_>>();
 
                     // convert children from Vec<&IndexedChild> to Vec<&Frame>
                     let children = children
@@ -520,11 +618,19 @@ fn merge_children(
                         &mut merged_child,
                         &children,
                         active_trace_ids_slice,
+                        &active_trace_indices,
+                        noise_context,
                         lost_frame_occurrences,
                         frequent_thresh,
                     );
 
-                    fill_annotations(&mut merged_child, &latencies, active_trace_ids_slice);
+                    fill_annotations(
+                        &mut merged_child,
+                        &latencies,
+                        active_trace_ids_slice,
+                        &active_trace_indices,
+                        noise_context,
+                    );
 
                     new_parent
                         .add_child(merged_child)
