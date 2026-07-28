@@ -33,6 +33,9 @@ struct NoiseContext<'a> {
 ///
 /// If `trace_ids` is provided, it must be a parallel list of unique identifiers for each trace. These
 /// IDs will be used to add raw data from the merging algorithm as an annotation to the merged trace.
+/// If `record_noise_contribution` is true, each merged frame will include its noise contribution in
+/// the merging stats annotation, provided that the end-to-end standard deviation is defined and
+/// nonzero.
 ///
 /// We will consider the case where we are merging multiple stack frames.
 /// Each stack frame is a sequence of child frames, e.g. a() := [f(), g(), f(), h()].
@@ -83,7 +86,11 @@ struct NoiseContext<'a> {
 /// Therefore, the final merged trace is r() := [f(), g(), z(), f(), h()].               \
 /// For each of child frame in r(), we create merged versions from the original
 /// child frames of a(), b(), and c().
-pub fn merge_traces(traces: &[&Trace], raw_trace_ids: Option<&[&str]>) -> Trace {
+pub fn merge_traces(
+    traces: &[&Trace],
+    raw_trace_ids: Option<&[&str]>,
+    record_noise_contribution: bool,
+) -> Trace {
     if traces.is_empty() {
         panic!("Cannot merge empty list of traces");
     } else if raw_trace_ids.is_some() && raw_trace_ids.unwrap().len() != traces.len() {
@@ -107,12 +114,16 @@ pub fn merge_traces(traces: &[&Trace], raw_trace_ids: Option<&[&str]>) -> Trace 
         .iter()
         .map(|f| f.metrics.end - f.metrics.start)
         .collect::<Vec<_>>();
-    let noise_context = Stats::from_data(latencies.iter().map(|latency| latency.ts as f64))
-        .filter(|stats| stats.stddev > 0.0)
-        .map(|stats| NoiseContext {
-            e2e_latencies: &latencies,
-            e2e_stddev: stats.stddev,
-        });
+    let noise_context = if record_noise_contribution {
+        Stats::from_data(latencies.iter().map(|latency| latency.ts as f64))
+            .filter(|stats| stats.stddev > 0.0)
+            .map(|stats| NoiseContext {
+                e2e_latencies: &latencies,
+                e2e_stddev: stats.stddev,
+            })
+    } else {
+        None
+    };
     let trace_indices = (0..traces.len()).collect::<Vec<_>>();
     let new_end = latencies.iter().sum::<Metrics>() / (frames.len() as u64);
     let mut new_root = Frame::new(

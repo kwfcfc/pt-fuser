@@ -339,7 +339,7 @@ fn merge_traces_no_children() {
     let trace2 = Trace::new(frame2, vec![]);
     let frame3 = produce_frames_from_metrics((400, 464), &[]);
     let trace3 = Trace::new(frame3, vec![]);
-    let merged = merge::merge_traces(&[&trace1, &trace2, &trace3], None);
+    let merged = merge::merge_traces(&[&trace1, &trace2, &trace3], None, false);
     assert_eq!(merged.root_frame().metrics.start, Metrics::constant(0));
     assert_eq!(
         merged.root_frame().metrics.end,
@@ -355,7 +355,7 @@ fn merge_traces_common_children() {
     let trace2 = Trace::new(frame2, vec![]);
     let frame3 = produce_frames_from_metrics((400, 464), &[(415, 430, None), (445, 458, None)]);
     let trace3 = Trace::new(frame3, vec![]);
-    let merged = merge::merge_traces(&[&trace1, &trace2, &trace3], None);
+    let merged = merge::merge_traces(&[&trace1, &trace2, &trace3], None, false);
     assert_eq!(merged.root_frame().metrics.start, Metrics::constant(0));
     assert_eq!(
         merged.root_frame().metrics.end,
@@ -533,7 +533,7 @@ fn merge_frame_with_anotations() {
         .iter()
         .map(|frame| Trace::new(frame.clone(), vec![]))
         .collect::<Vec<_>>();
-    let merged = merge::merge_traces(&traces.iter().collect::<Vec<_>>(), None);
+    let merged = merge::merge_traces(&traces.iter().collect::<Vec<_>>(), None, true);
     assert_eq!(merged.root_frame().chunks().len(), 3);
 
     let root_anotations = &merged.root_frame().annotations;
@@ -608,6 +608,33 @@ fn merge_frame_with_anotations() {
 }
 
 #[test]
+fn merge_frame_omits_noise_contribution_when_not_requested() {
+    let root_frames = (0..10)
+        .map(|i| produce_frames_from_metrics((0, 100 + i), &[(10, 20 + i, Some("a"))]))
+        .collect::<Vec<_>>();
+    let traces = root_frames
+        .iter()
+        .map(|frame| Trace::new(frame.clone(), vec![]))
+        .collect::<Vec<_>>();
+
+    let merged = merge::merge_traces(&traces.iter().collect::<Vec<_>>(), None, false);
+    let root_stats = match &merged.root_frame().annotations[super::ANNOTATION_STATS_NAME] {
+        Annotation::Map(stats) => stats,
+        _ => panic!("Expected root stats annotation to be a map"),
+    };
+    assert!(!root_stats.contains_key(super::ANNOTATION_NOISE_CONTRIBUTION_NAME));
+
+    let child_stats = match &merged.root_frame().chunks()[1] {
+        merge::Chunk::Frame(child) => match &child.annotations[super::ANNOTATION_STATS_NAME] {
+            Annotation::Map(stats) => stats,
+            _ => panic!("Expected child stats annotation to be a map"),
+        },
+        _ => panic!("Expected child to be a frame"),
+    };
+    assert!(!child_stats.contains_key(super::ANNOTATION_NOISE_CONTRIBUTION_NAME));
+}
+
+#[test]
 fn merge_frame_omits_noise_contribution_when_e2e_stddev_is_zero() {
     let root_frames = (0..10)
         .map(|i| produce_frames_from_metrics((0, 100), &[(10, 20 + i, Some("a"))]))
@@ -617,7 +644,7 @@ fn merge_frame_omits_noise_contribution_when_e2e_stddev_is_zero() {
         .map(|frame| Trace::new(frame.clone(), vec![]))
         .collect::<Vec<_>>();
 
-    let merged = merge::merge_traces(&traces.iter().collect::<Vec<_>>(), None);
+    let merged = merge::merge_traces(&traces.iter().collect::<Vec<_>>(), None, true);
     let root_stats = match &merged.root_frame().annotations[super::ANNOTATION_STATS_NAME] {
         Annotation::Map(stats) => stats,
         _ => panic!("Expected root stats annotation to be a map"),
@@ -659,7 +686,7 @@ fn merge_frame_adds_noise_contribution_to_nested_frame_with_missing_traces() {
         .map(|frame| Trace::new(frame.clone(), vec![]))
         .collect::<Vec<_>>();
 
-    let merged = merge::merge_traces(&traces.iter().collect::<Vec<_>>(), None);
+    let merged = merge::merge_traces(&traces.iter().collect::<Vec<_>>(), None, true);
     let outer = match &merged.root_frame().chunks()[1] {
         merge::Chunk::Frame(outer) => outer,
         _ => panic!("Expected outer child to be a frame"),
@@ -719,6 +746,7 @@ fn merge_traces_export_raw() {
     let merged = merge::merge_traces(
         &[&trace1, &trace2, &trace3, &trace4],
         Some(&["t1", "t2", "t3", "t4"]),
+        false,
     );
     let root_frame = merged.root_frame();
     let root_raw_data = root_frame
