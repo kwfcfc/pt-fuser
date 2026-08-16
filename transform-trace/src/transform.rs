@@ -4,7 +4,7 @@ use std::{
 
 use pt_fuser::trace::{
     SymbolInfo, Trace,
-    builder::{BuilderResult, PausedTraceBuilder, TraceBuilder},
+    builder::{BuilderResult, FrameCompletionOptions, PausedTraceBuilder, TraceBuilder},
     metrics::Metrics,
     trace_error,
 };
@@ -72,7 +72,9 @@ fn export_trace(output_dir: &str, trace_num: u32, tid: i32, trace: Trace) {
     THREADPOOL
         .get_or_init(|| {
             ThreadPool::new(
-                <NonZero<usize> as Into<usize>>::into(thread::available_parallelism().unwrap()) - 1,
+                <NonZero<usize> as Into<usize>>::into(thread::available_parallelism().unwrap())
+                    .saturating_sub(1)
+                    .max(1),
             )
         })
         .execute(move || {
@@ -123,7 +125,12 @@ fn process_return_event(
 ) -> Option<TraceBuilder> {
     for i in 1..=levels {
         builder = match builder
-            .complete_frame(state.cur_metrics)
+            .complete_frame(
+                state.cur_metrics,
+                Some(FrameCompletionOptions {
+                    remove_plt_stubs: true,
+                }),
+            )
             .expect("Failed to complete stack frame")
         {
             BuilderResult::Completed(trace) => {
