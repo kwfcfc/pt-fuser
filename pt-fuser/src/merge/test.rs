@@ -1,34 +1,47 @@
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use crate::{
     merge,
     trace::{
-        Annotation, Event, Frame, SymbolInfo, Trace,
+        Annotation, Chunk, Event, Frame, SymbolInfo, Trace,
+        builder::SymbolCache,
         metrics::{Metrics, MetricsRange},
     },
 };
 
-const DUMMY_RANGE: MetricsRange = MetricsRange {
-    start: Metrics {
+const DUMMY_RANGE_END: Metrics = Metrics {
+    ts: 200,
+    cycles: 200,
+    insn_count: 200,
+};
+const DUMMY_RANGE: MetricsRange = MetricsRange::new(
+    Metrics {
         ts: 100,
         cycles: 100,
         insn_count: 100,
     },
-    end: Metrics {
-        ts: 200,
-        cycles: 200,
-        insn_count: 200,
-    },
-};
+    &DUMMY_RANGE_END,
+);
 
-const DUMMY_SYMBOL: LazyLock<SymbolInfo> = LazyLock::new(|| SymbolInfo {
-    name: "dummy".to_string(),
-    offset: 1,
-    size: 1,
+const DUMMY_SYMBOL: LazyLock<Arc<SymbolInfo>> = LazyLock::new(|| {
+    Arc::new(SymbolInfo {
+        name: "dummy".to_string(),
+        offset: 1,
+        size: 1,
+    })
 });
 
-const DUMMY_FRAME: LazyLock<Frame> =
-    LazyLock::new(|| Frame::new(DUMMY_RANGE, DUMMY_SYMBOL.clone()));
+const SYMBOLS: LazyLock<Vec<Arc<SymbolInfo>>> = LazyLock::new(|| vec![DUMMY_SYMBOL.clone()]);
+
+fn new_frame(range: MetricsRange) -> Frame {
+    Frame::new(range, 0, DUMMY_SYMBOL.clone())
+}
+
+fn new_trace(root: Frame) -> Trace {
+    Trace::new(SYMBOLS.clone(), root, vec![])
+}
+
+const DUMMY_FRAME: LazyLock<Frame> = LazyLock::new(|| new_frame(DUMMY_RANGE));
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct TestLCS {
@@ -49,12 +62,12 @@ impl merge::Id for &TestLCS {
 
 // special symbol called "[pause]" represents a pause chunk
 fn produce_chunks_from_symbols(symbols: &[&str]) -> Frame {
-    let mut frame = Frame::new(DUMMY_RANGE, DUMMY_SYMBOL.clone());
+    let mut frame = new_frame(DUMMY_RANGE);
     for (i, &symbol) in symbols.iter().enumerate() {
-        let range = MetricsRange {
-            start: Metrics::new(100 + i as u64, 100 + i as u64, 100 + i as u64),
-            end: Metrics::new(101 + i as u64, 101 + i as u64, 101 + i as u64),
-        };
+        let range = MetricsRange::new(
+            Metrics::new(100 + i as u64, 100 + i as u64, 100 + i as u64),
+            &Metrics::new(101 + i as u64, 101 + i as u64, 101 + i as u64),
+        );
         if symbol == "[pause]" {
             frame
                 .add_pause(range)
@@ -63,11 +76,12 @@ fn produce_chunks_from_symbols(symbols: &[&str]) -> Frame {
             frame
                 .add_child(Frame::new(
                     range,
-                    SymbolInfo {
+                    0,
+                    Arc::new(SymbolInfo {
                         name: symbol.to_string(),
                         offset: 1,
                         size: 1,
-                    },
+                    }),
                 ))
                 .expect(&format!("Failed to add child '{}' to frame", symbol));
         }
@@ -77,12 +91,12 @@ fn produce_chunks_from_symbols(symbols: &[&str]) -> Frame {
 
 // special symbol called "[pause]" represents a pause chunk
 fn produce_frames_from_metrics(root: (u64, u64), children: &[(u64, u64, Option<&str>)]) -> Frame {
-    let mut frame = Frame::new(
-        MetricsRange::new(Metrics::constant(root.0), Metrics::constant(root.1)),
-        DUMMY_SYMBOL.clone(),
-    );
+    let mut frame = new_frame(MetricsRange::new(
+        Metrics::constant(root.0),
+        &Metrics::constant(root.1),
+    ));
     for &(start, end, symbol) in children {
-        let range = MetricsRange::new(Metrics::constant(start), Metrics::constant(end));
+        let range = MetricsRange::new(Metrics::constant(start), &Metrics::constant(end));
         if symbol.is_some() && symbol.unwrap() == "[pause]" {
             frame
                 .add_pause(range)
@@ -94,11 +108,14 @@ fn produce_frames_from_metrics(root: (u64, u64), children: &[(u64, u64, Option<&
                     offset: 1,
                     size: 1,
                 })
+                .map(Arc::new)
                 .unwrap_or(DUMMY_SYMBOL.clone());
-            frame.add_child(Frame::new(range, symbol)).expect(&format!(
-                "Failed to add child with range ({}, {}) to frame",
-                start, end
-            ));
+            frame
+                .add_child(Frame::new(range, 0, symbol))
+                .expect(&format!(
+                    "Failed to add child with range ({}, {}) to frame",
+                    start, end
+                ));
         }
     }
     frame
@@ -110,6 +127,20 @@ fn extract_ids(frames: &[impl merge::Id]) -> Vec<u32> {
 
 fn seq(xs: &[u32]) -> Vec<TestLCS> {
     xs.iter().map(|x| TestLCS { id: *x }).collect()
+}
+
+fn extract_pause_chunk<'a>(chunk: &'a Chunk) -> &'a MetricsRange {
+    match chunk {
+        Chunk::Pause(pause) => pause,
+        _ => panic!("Expected pause chunk"),
+    }
+}
+
+fn extract_frame_chunk<'a>(chunk: &'a Chunk) -> &'a Frame {
+    match chunk {
+        Chunk::Frame(frame) => frame,
+        _ => panic!("Expected frame chunk"),
+    }
 }
 
 #[test]
@@ -334,15 +365,15 @@ fn common_slicing_heuristic() {
 #[test]
 fn merge_traces_no_children() {
     let frame1 = produce_frames_from_metrics((500, 590), &[]);
-    let trace1 = Trace::new(frame1, vec![]);
+    let trace1 = new_trace(frame1);
     let frame2 = produce_frames_from_metrics((300, 380), &[]);
-    let trace2 = Trace::new(frame2, vec![]);
+    let trace2 = new_trace(frame2);
     let frame3 = produce_frames_from_metrics((400, 464), &[]);
-    let trace3 = Trace::new(frame3, vec![]);
+    let trace3 = new_trace(frame3);
     let merged = merge::merge_traces(&[&trace1, &trace2, &trace3], None, false);
     assert_eq!(merged.root_frame().metrics.start, Metrics::constant(0));
     assert_eq!(
-        merged.root_frame().metrics.end,
+        merged.root_frame().metrics.end(),
         Metrics::constant((90 + 80 + 64) / 3)
     );
 }
@@ -350,30 +381,26 @@ fn merge_traces_no_children() {
 #[test]
 fn merge_traces_common_children() {
     let frame1 = produce_frames_from_metrics((500, 590), &[(520, 540, None), (550, 558, None)]);
-    let trace1 = Trace::new(frame1, vec![]);
+    let trace1 = new_trace(frame1);
     let frame2 = produce_frames_from_metrics((300, 380), &[(310, 335, None), (340, 352, None)]);
-    let trace2 = Trace::new(frame2, vec![]);
+    let trace2 = new_trace(frame2);
     let frame3 = produce_frames_from_metrics((400, 464), &[(415, 430, None), (445, 458, None)]);
-    let trace3 = Trace::new(frame3, vec![]);
+    let trace3 = new_trace(frame3);
     let merged = merge::merge_traces(&[&trace1, &trace2, &trace3], None, false);
     assert_eq!(merged.root_frame().metrics.start, Metrics::constant(0));
     assert_eq!(
-        merged.root_frame().metrics.end,
+        merged.root_frame().metrics.end(),
         Metrics::constant((90 + 80 + 64) / 3)
     );
 
-    assert_eq!(merged.root_frame().chunks().len(), 5);
-    let child1 = &merged.root_frame().chunks()[1];
-    let child2 = &merged.root_frame().chunks()[3];
-    match (child1, child2) {
-        (merge::Chunk::Frame(child_frame1), merge::Chunk::Frame(child_frame2)) => {
-            assert_eq!(child_frame1.metrics.start, Metrics::constant(15));
-            assert_eq!(child_frame1.metrics.end, Metrics::constant(15 + 20));
-            assert_eq!(child_frame2.metrics.start, Metrics::constant(45));
-            assert_eq!(child_frame2.metrics.end, Metrics::constant(45 + 11));
-        }
-        _ => panic!("Expected children to be framesi"),
-    }
+    let chunks = merged.root_frame().chunks().collect::<Vec<_>>();
+    assert_eq!(chunks.len(), 5);
+    let child_frame1 = extract_frame_chunk(&chunks[1]);
+    let child_frame2 = extract_frame_chunk(&chunks[3]);
+    assert_eq!(child_frame1.metrics.start, Metrics::constant(15));
+    assert_eq!(child_frame1.metrics.end(), Metrics::constant(15 + 20));
+    assert_eq!(child_frame2.metrics.start, Metrics::constant(45));
+    assert_eq!(child_frame2.metrics.end(), Metrics::constant(45 + 11));
 }
 
 #[test]
@@ -402,44 +429,36 @@ fn merge_frame_frequent_children() {
             (400, 410, Some("c")),
         ],
     );
-    let mut merged = Frame::new(
-        MetricsRange::new(
-            Metrics::constant(50),
-            Metrics::constant(50 + (90 + 80 + 64) / 3),
-        ),
-        DUMMY_SYMBOL.clone(),
-    );
+    let mut symbol_cache = SymbolCache::new(10);
+    let mut merged = new_frame(MetricsRange::new(
+        Metrics::constant(50),
+        &Metrics::constant(50 + (90 + 80 + 64) / 3),
+    ));
     merge::merge_children(
         &mut merged,
         &[&frame1, &frame2, &frame3],
         None,
         &[0, 1, 2],
         None,
+        &mut symbol_cache,
         &mut Vec::new(),
         0.6,
     );
-    assert_eq!(merged.chunks().len(), 7);
-    let child1 = &merged.chunks()[1];
-    let child2 = &merged.chunks()[3];
-    let child3 = &merged.chunks()[5];
-    match (child1, child2, child3) {
-        (
-            merge::Chunk::Frame(child_frame1),
-            merge::Chunk::Frame(child_frame2),
-            merge::Chunk::Frame(child_frame3),
-        ) => {
-            assert_eq!(child_frame1.metrics.start, Metrics::constant(50 + 12));
-            assert_eq!(child_frame1.metrics.end, Metrics::constant(50 + 12 + 9));
-            assert_eq!(child_frame1.symbol.name, "a");
-            assert_eq!(child_frame2.metrics.start, Metrics::constant(50 + 40));
-            assert_eq!(child_frame2.metrics.end, Metrics::constant(50 + 40 + 1));
-            assert_eq!(child_frame2.symbol.name, "common");
-            assert_eq!(child_frame3.metrics.start, Metrics::constant(50 + 52));
-            assert_eq!(child_frame3.metrics.end, Metrics::constant(50 + 52 + 8));
-            assert_eq!(child_frame3.symbol.name, "b");
-        }
-        _ => panic!("Expected children to be framesi"),
-    }
+
+    let chunks = merged.chunks().collect::<Vec<_>>();
+    assert_eq!(chunks.len(), 7);
+    let child_frame1 = extract_frame_chunk(&chunks[1]);
+    let child_frame2 = extract_frame_chunk(&chunks[3]);
+    let child_frame3 = extract_frame_chunk(&chunks[5]);
+    assert_eq!(child_frame1.metrics.start, Metrics::constant(50 + 12));
+    assert_eq!(child_frame1.metrics.end(), Metrics::constant(50 + 12 + 9));
+    assert_eq!(child_frame1.symbol.name, "a");
+    assert_eq!(child_frame2.metrics.start, Metrics::constant(50 + 40));
+    assert_eq!(child_frame2.metrics.end(), Metrics::constant(50 + 40 + 1));
+    assert_eq!(child_frame2.symbol.name, "common");
+    assert_eq!(child_frame3.metrics.start, Metrics::constant(50 + 52));
+    assert_eq!(child_frame3.metrics.end(), Metrics::constant(50 + 52 + 8));
+    assert_eq!(child_frame3.symbol.name, "b");
 }
 
 #[test]
@@ -470,47 +489,40 @@ fn merge_frame_with_pauses() {
             (250, 260, Some("c")),
         ],
     );
-    let mut merged = Frame::new(
-        MetricsRange::new(Metrics::constant(0), Metrics::constant(133)),
-        DUMMY_SYMBOL.clone(),
-    );
+    let mut symbol_cache = SymbolCache::new(10);
+    let mut merged = new_frame(MetricsRange::new(
+        Metrics::constant(0),
+        &Metrics::constant(133),
+    ));
     merge::merge_children(
         &mut merged,
         &[&frame1, &frame2, &frame3],
         None,
         &[0, 1, 2],
         None,
+        &mut symbol_cache,
         &mut Vec::new(),
         0.6,
     );
     // result: "a" "[pause]" "[pause]" "c"
     // where the two pause chunks are contiguous
 
-    assert_eq!(merged.chunks().len(), 8);
-    let a = &merged.chunks()[1];
-    let pause1 = &merged.chunks()[3];
-    let pause2 = &merged.chunks()[4];
-    let c = &merged.chunks()[6];
-    match (a, pause1, pause2, c) {
-        (
-            merge::Chunk::Frame(a),
-            merge::Chunk::Pause(pause1),
-            merge::Chunk::Pause(pause2),
-            merge::Chunk::Frame(c),
-        ) => {
-            assert_eq!(a.metrics.start, Metrics::constant(20));
-            assert_eq!(a.metrics.end, Metrics::constant(20 + 15));
-            assert_eq!(a.symbol.name, "a");
-            assert_eq!(pause1.start, Metrics::constant(40));
-            assert_eq!(pause1.end, Metrics::constant(40 + 13));
-            assert_eq!(pause2.start, Metrics::constant(53));
-            assert_eq!(pause2.end, Metrics::constant(53 + 10 - 3));
-            assert_eq!(c.metrics.start, Metrics::constant(115));
-            assert_eq!(c.metrics.end, Metrics::constant(115 + 10));
-            assert_eq!(c.symbol.name, "c");
-        }
-        _ => panic!("Expected children to be a pattern of frames and pauses"),
-    }
+    let chunks = merged.chunks().collect::<Vec<_>>();
+    assert_eq!(chunks.len(), 8);
+    let a = extract_frame_chunk(&chunks[1]);
+    let pause1 = extract_pause_chunk(&chunks[3]);
+    let pause2 = extract_pause_chunk(&chunks[4]);
+    let c = extract_frame_chunk(&chunks[6]);
+    assert_eq!(a.metrics.start, Metrics::constant(20));
+    assert_eq!(a.metrics.end(), Metrics::constant(20 + 15));
+    assert_eq!(a.symbol.name, "a");
+    assert_eq!(pause1.start, Metrics::constant(40));
+    assert_eq!(pause1.end(), Metrics::constant(40 + 13));
+    assert_eq!(pause2.start, Metrics::constant(53));
+    assert_eq!(pause2.end(), Metrics::constant(53 + 10 - 3));
+    assert_eq!(c.metrics.start, Metrics::constant(115));
+    assert_eq!(c.metrics.end(), Metrics::constant(115 + 10));
+    assert_eq!(c.symbol.name, "c");
 }
 
 #[test]
@@ -531,21 +543,19 @@ fn merge_frame_with_anotations() {
     ];
     let traces = root_frames
         .iter()
-        .map(|frame| Trace::new(frame.clone(), vec![]))
+        .map(|frame| new_trace(frame.clone()))
         .collect::<Vec<_>>();
     let merged = merge::merge_traces(&traces.iter().collect::<Vec<_>>(), None, true);
-    assert_eq!(merged.root_frame().chunks().len(), 3);
+    assert_eq!(merged.root_frame().chunks().count(), 3);
 
-    let root_anotations = &merged.root_frame().annotations;
+    let root_anotations = merged.root_frame().annotations.as_ref().unwrap();
     let root_stats = match &root_anotations[super::ANNOTATION_STATS_NAME] {
         Annotation::Map(stats) => stats,
         _ => panic!("Expected stats annotation to be a map"),
     };
 
-    let child_anotations = match &merged.root_frame().chunks()[1] {
-        merge::Chunk::Frame(child_frame) => &child_frame.annotations,
-        _ => panic!("Expected child to be a frame"),
-    };
+    let child = merged.root_frame().chunks().nth(1).unwrap();
+    let child_anotations = extract_frame_chunk(&child).annotations.as_ref().unwrap();
     let child_stats = match &child_anotations[super::ANNOTATION_STATS_NAME] {
         Annotation::Map(stats) => stats,
         _ => panic!("Expected stats annotation to be a map"),
@@ -614,22 +624,22 @@ fn merge_frame_omits_noise_contribution_when_not_requested() {
         .collect::<Vec<_>>();
     let traces = root_frames
         .iter()
-        .map(|frame| Trace::new(frame.clone(), vec![]))
+        .map(|frame| new_trace(frame.clone()))
         .collect::<Vec<_>>();
 
     let merged = merge::merge_traces(&traces.iter().collect::<Vec<_>>(), None, false);
-    let root_stats = match &merged.root_frame().annotations[super::ANNOTATION_STATS_NAME] {
+    let root_annotations = merged.root_frame().annotations.as_ref().unwrap();
+    let root_stats = match &root_annotations[super::ANNOTATION_STATS_NAME] {
         Annotation::Map(stats) => stats,
         _ => panic!("Expected root stats annotation to be a map"),
     };
     assert!(!root_stats.contains_key(super::ANNOTATION_NOISE_CONTRIBUTION_NAME));
 
-    let child_stats = match &merged.root_frame().chunks()[1] {
-        merge::Chunk::Frame(child) => match &child.annotations[super::ANNOTATION_STATS_NAME] {
-            Annotation::Map(stats) => stats,
-            _ => panic!("Expected child stats annotation to be a map"),
-        },
-        _ => panic!("Expected child to be a frame"),
+    let child = merged.root_frame().chunks().nth(1).unwrap();
+    let child_annotations = extract_frame_chunk(&child).annotations.as_ref().unwrap();
+    let child_stats = match &child_annotations[super::ANNOTATION_STATS_NAME] {
+        Annotation::Map(stats) => stats,
+        _ => panic!("Expected child stats annotation to be a map"),
     };
     assert!(!child_stats.contains_key(super::ANNOTATION_NOISE_CONTRIBUTION_NAME));
 }
@@ -641,23 +651,23 @@ fn merge_frame_omits_noise_contribution_when_e2e_stddev_is_zero() {
         .collect::<Vec<_>>();
     let traces = root_frames
         .iter()
-        .map(|frame| Trace::new(frame.clone(), vec![]))
+        .map(|frame| new_trace(frame.clone()))
         .collect::<Vec<_>>();
 
     let merged = merge::merge_traces(&traces.iter().collect::<Vec<_>>(), None, true);
-    let root_stats = match &merged.root_frame().annotations[super::ANNOTATION_STATS_NAME] {
+    let root_annotations = merged.root_frame().annotations.as_ref().unwrap();
+    let root_stats = match &root_annotations[super::ANNOTATION_STATS_NAME] {
         Annotation::Map(stats) => stats,
         _ => panic!("Expected root stats annotation to be a map"),
     };
     assert_eq!(root_stats["Std Dev"], Annotation::Double(0.0));
     assert!(!root_stats.contains_key(super::ANNOTATION_NOISE_CONTRIBUTION_NAME));
 
-    let child_stats = match &merged.root_frame().chunks()[1] {
-        merge::Chunk::Frame(child) => match &child.annotations[super::ANNOTATION_STATS_NAME] {
-            Annotation::Map(stats) => stats,
-            _ => panic!("Expected child stats annotation to be a map"),
-        },
-        _ => panic!("Expected child to be a frame"),
+    let child = merged.root_frame().chunks().nth(1).unwrap();
+    let child_annotations = extract_frame_chunk(&child).annotations.as_ref().unwrap();
+    let child_stats = match &child_annotations[super::ANNOTATION_STATS_NAME] {
+        Annotation::Map(stats) => stats,
+        _ => panic!("Expected child stats annotation to be a map"),
     };
     assert!(!child_stats.contains_key(super::ANNOTATION_NOISE_CONTRIBUTION_NAME));
 }
@@ -671,35 +681,36 @@ fn merge_frame_adds_noise_contribution_to_nested_frame_with_missing_traces() {
             } else {
                 produce_frames_from_metrics((10, 80), &[])
             };
-            outer.symbol.name = "outer".to_string();
+            outer.symbol = Arc::new(SymbolInfo {
+                name: "outer".to_string(),
+                offset: outer.symbol.offset,
+                size: outer.symbol.size,
+            });
 
-            let mut root = Frame::new(
-                MetricsRange::new(Metrics::constant(0), Metrics::constant(100 + 2 * i)),
-                DUMMY_SYMBOL.clone(),
-            );
+            let mut root = new_frame(MetricsRange::new(
+                Metrics::constant(0),
+                &Metrics::constant(100 + 2 * i),
+            ));
             root.add_child(outer).unwrap();
             root
         })
         .collect::<Vec<_>>();
     let traces = root_frames
         .iter()
-        .map(|frame| Trace::new(frame.clone(), vec![]))
+        .map(|frame| new_trace(frame.clone()))
         .collect::<Vec<_>>();
 
     let merged = merge::merge_traces(&traces.iter().collect::<Vec<_>>(), None, true);
-    let outer = match &merged.root_frame().chunks()[1] {
-        merge::Chunk::Frame(outer) => outer,
-        _ => panic!("Expected outer child to be a frame"),
-    };
-    let nested = match &outer.chunks()[1] {
-        merge::Chunk::Frame(nested) => nested,
-        _ => panic!("Expected nested child to be a frame"),
-    };
+    let outer = merged.root_frame().chunks().nth(1).unwrap();
+    let outer = extract_frame_chunk(&outer);
+    let nested = outer.chunks().nth(1).unwrap();
+    let nested = extract_frame_chunk(&nested);
+    let nested_annotations = nested.annotations.as_ref().unwrap();
     assert_eq!(
-        nested.annotations[super::ANNOTATION_COUNT_NAME],
+        nested_annotations[super::ANNOTATION_COUNT_NAME],
         Annotation::Uint64(7)
     );
-    let nested_stats = match &nested.annotations[super::ANNOTATION_STATS_NAME] {
+    let nested_stats = match &nested_annotations[super::ANNOTATION_STATS_NAME] {
         Annotation::Map(stats) => stats,
         _ => panic!("Expected nested stats annotation to be a map"),
     };
@@ -712,36 +723,36 @@ fn merge_frame_adds_noise_contribution_to_nested_frame_with_missing_traces() {
 #[test]
 fn merge_traces_export_raw() {
     let frame1 = produce_frames_from_metrics((500, 590), &[(520, 540, Some("a"))]);
-    let mut root1 = Frame::new(
-        MetricsRange::new(Metrics::constant(500), Metrics::constant(600)),
-        DUMMY_SYMBOL.clone(),
-    );
+    let mut root1 = new_frame(MetricsRange::new(
+        Metrics::constant(500),
+        &Metrics::constant(600),
+    ));
     root1.add_child(frame1).unwrap();
-    let trace1 = Trace::new(root1, vec![]);
+    let trace1 = new_trace(root1);
 
     let frame2 = produce_frames_from_metrics((300, 380), &[(310, 335, Some("a"))]);
-    let mut root2 = Frame::new(
-        MetricsRange::new(Metrics::constant(300), Metrics::constant(400)),
-        DUMMY_SYMBOL.clone(),
-    );
+    let mut root2 = new_frame(MetricsRange::new(
+        Metrics::constant(300),
+        &Metrics::constant(400),
+    ));
     root2.add_child(frame2).unwrap();
-    let trace2 = Trace::new(root2, vec![]);
+    let trace2 = new_trace(root2);
 
     let frame3 = produce_frames_from_metrics((400, 464), &[]);
-    let mut root3 = Frame::new(
-        MetricsRange::new(Metrics::constant(400), Metrics::constant(500)),
-        DUMMY_SYMBOL.clone(),
-    );
+    let mut root3 = new_frame(MetricsRange::new(
+        Metrics::constant(400),
+        &Metrics::constant(500),
+    ));
     root3.add_child(frame3).unwrap();
-    let trace3 = Trace::new(root3, vec![]);
+    let trace3 = new_trace(root3);
 
     let frame4 = produce_frames_from_metrics((0, 80), &[(10, 60, Some("a"))]);
-    let mut root4 = Frame::new(
-        MetricsRange::new(Metrics::constant(0), Metrics::constant(100)),
-        DUMMY_SYMBOL.clone(),
-    );
+    let mut root4 = new_frame(MetricsRange::new(
+        Metrics::constant(0),
+        &Metrics::constant(100),
+    ));
     root4.add_child(frame4).unwrap();
-    let trace4 = Trace::new(root4, vec![]);
+    let trace4 = new_trace(root4);
 
     let merged = merge::merge_traces(
         &[&trace1, &trace2, &trace3, &trace4],
@@ -751,6 +762,8 @@ fn merge_traces_export_raw() {
     let root_frame = merged.root_frame();
     let root_raw_data = root_frame
         .annotations
+        .as_ref()
+        .unwrap()
         .get(merge::ANNOTATION_RAW_DATA_NAME)
         .expect("Root frame should have raw data annotation");
     match root_raw_data {
@@ -763,42 +776,40 @@ fn merge_traces_export_raw() {
         _ => panic!("Expected root raw data annotation to be a map"),
     }
 
-    match &root_frame.chunks()[0] {
-        merge::Chunk::Frame(child) => {
-            let child_raw_data = child
-                .annotations
-                .get(merge::ANNOTATION_RAW_DATA_NAME)
-                .expect("Child frame should have raw data annotation");
-            match child_raw_data {
-                Annotation::Map(map) => {
-                    assert_eq!(map.get("t1"), Some(&Annotation::Uint64(90)));
-                    assert_eq!(map.get("t2"), Some(&Annotation::Uint64(80)));
-                    assert_eq!(map.get("t3"), Some(&Annotation::Uint64(64)));
-                    assert_eq!(map.get("t4"), Some(&Annotation::Uint64(80)));
-                }
-                _ => panic!("Expected child raw data annotation to be a map"),
-            }
-
-            match &child.chunks()[1] {
-                merge::Chunk::Frame(grandchild) => {
-                    let grandchild_raw_data = grandchild
-                        .annotations
-                        .get(merge::ANNOTATION_RAW_DATA_NAME)
-                        .expect("Grandchild frame should have raw data annotation");
-                    match grandchild_raw_data {
-                        Annotation::Map(map) => {
-                            assert_eq!(map.get("t1"), Some(&Annotation::Uint64(20)));
-                            assert_eq!(map.get("t2"), Some(&Annotation::Uint64(25)));
-                            assert!(!map.contains_key("t3"));
-                            assert_eq!(map.get("t4"), Some(&Annotation::Uint64(50)));
-                        }
-                        _ => panic!("Expected grandchild raw data annotation to be a map"),
-                    }
-                }
-                _ => panic!("Expected grandchild chunk to be a frame"),
-            }
+    let child = root_frame.chunks().next().unwrap();
+    let child = extract_frame_chunk(&child);
+    let child_raw_data = child
+        .annotations
+        .as_ref()
+        .unwrap()
+        .get(merge::ANNOTATION_RAW_DATA_NAME)
+        .expect("Child frame should have raw data annotation");
+    match child_raw_data {
+        Annotation::Map(map) => {
+            assert_eq!(map.get("t1"), Some(&Annotation::Uint64(90)));
+            assert_eq!(map.get("t2"), Some(&Annotation::Uint64(80)));
+            assert_eq!(map.get("t3"), Some(&Annotation::Uint64(64)));
+            assert_eq!(map.get("t4"), Some(&Annotation::Uint64(80)));
         }
-        _ => panic!("Expected first chunk to be a frame"),
+        _ => panic!("Expected child raw data annotation to be a map"),
+    }
+
+    let grandchild = &child.chunks().nth(1).unwrap();
+    let grandchild = extract_frame_chunk(&grandchild);
+    let grandchild_raw_data = grandchild
+        .annotations
+        .as_ref()
+        .unwrap()
+        .get(merge::ANNOTATION_RAW_DATA_NAME)
+        .expect("Grandchild frame should have raw data annotation");
+    match grandchild_raw_data {
+        Annotation::Map(map) => {
+            assert_eq!(map.get("t1"), Some(&Annotation::Uint64(20)));
+            assert_eq!(map.get("t2"), Some(&Annotation::Uint64(25)));
+            assert!(!map.contains_key("t3"));
+            assert_eq!(map.get("t4"), Some(&Annotation::Uint64(50)));
+        }
+        _ => panic!("Expected grandchild raw data annotation to be a map"),
     }
 }
 
@@ -817,9 +828,17 @@ fn merge_events_simple() {
     let mut event_c1 = Event::new(3, "C".to_string(), "Desc".to_string());
     event_c1.add_occurence(Metrics::constant(140));
 
-    let trace1 = Trace::new(DUMMY_FRAME.clone(), vec![event_a1]);
-    let trace2 = Trace::new(DUMMY_FRAME.clone(), vec![event_a2, event_b1]);
-    let trace3 = Trace::new(DUMMY_FRAME.clone(), vec![event_b2, event_c1]);
+    let trace1 = Trace::new(SYMBOLS.clone(), DUMMY_FRAME.clone(), vec![event_a1]);
+    let trace2 = Trace::new(
+        SYMBOLS.clone(),
+        DUMMY_FRAME.clone(),
+        vec![event_a2, event_b1],
+    );
+    let trace3 = Trace::new(
+        SYMBOLS.clone(),
+        DUMMY_FRAME.clone(),
+        vec![event_b2, event_c1],
+    );
     let merged_events = merge::merge_events(&[&trace1, &trace2, &trace3], &DUMMY_RANGE);
     assert_eq!(merged_events.len(), 3);
 
@@ -857,22 +876,24 @@ fn merge_events_scaling() {
     event_b.add_occurence(Metrics::constant(405));
 
     let trace1 = Trace::new(
-        Frame::new(
-            MetricsRange::new(Metrics::constant(250), Metrics::constant(500)),
-            DUMMY_SYMBOL.clone(),
-        ),
+        SYMBOLS.clone(),
+        new_frame(MetricsRange::new(
+            Metrics::constant(250),
+            &Metrics::constant(500),
+        )),
         vec![event_a],
     );
     let trace2 = Trace::new(
-        Frame::new(
-            MetricsRange::new(Metrics::constant(325), Metrics::constant(425)),
-            DUMMY_SYMBOL.clone(),
-        ),
+        SYMBOLS.clone(),
+        new_frame(MetricsRange::new(
+            Metrics::constant(325),
+            &Metrics::constant(425),
+        )),
         vec![event_b],
     );
     let merged_events = merge::merge_events(
         &[&trace1, &trace2],
-        &MetricsRange::new(Metrics::constant(20), Metrics::constant(100)),
+        &MetricsRange::new(Metrics::constant(20), &Metrics::constant(100)),
     );
 
     assert_eq!(merged_events.len(), 2);
@@ -905,22 +926,24 @@ fn merge_events_zipped_scaled() {
     event_a2.add_occurence(Metrics::constant(405));
 
     let trace1 = Trace::new(
-        Frame::new(
-            MetricsRange::new(Metrics::constant(250), Metrics::constant(500)),
-            DUMMY_SYMBOL.clone(),
-        ),
+        SYMBOLS.clone(),
+        new_frame(MetricsRange::new(
+            Metrics::constant(250),
+            &Metrics::constant(500),
+        )),
         vec![event_a1],
     );
     let trace2 = Trace::new(
-        Frame::new(
-            MetricsRange::new(Metrics::constant(325), Metrics::constant(425)),
-            DUMMY_SYMBOL.clone(),
-        ),
+        SYMBOLS.clone(),
+        new_frame(MetricsRange::new(
+            Metrics::constant(325),
+            &Metrics::constant(425),
+        )),
         vec![event_a2],
     );
     let merged_events = merge::merge_events(
         &[&trace1, &trace2],
-        &MetricsRange::new(Metrics::constant(20), Metrics::constant(100)),
+        &MetricsRange::new(Metrics::constant(20), &Metrics::constant(100)),
     );
     assert_eq!(merged_events.len(), 1);
 

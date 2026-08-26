@@ -13,6 +13,7 @@ use crate::{
     analysis::Stats,
     trace::{
         Annotation, Chunk, Event, Frame, Trace,
+        builder::SymbolCache,
         metrics::{Metrics, MetricsRange},
         trace_error,
     },
@@ -110,9 +111,12 @@ pub fn merge_traces(
 
     info!("Merging frames for {} traces...", traces.len());
 
+    let mut symbol_cache = SymbolCache::new(traces[0].num_symbols());
+    let root_idx = symbol_cache.get_or_insert((*frames[0].symbol).clone());
+
     let latencies = frames
         .iter()
-        .map(|f| f.metrics.end - f.metrics.start)
+        .map(|f| f.metrics.end() - f.metrics.start)
         .collect::<Vec<_>>();
     let noise_context = if record_noise_contribution {
         Stats::from_data(latencies.iter().map(|latency| latency.ts as f64))
@@ -127,8 +131,9 @@ pub fn merge_traces(
     let trace_indices = (0..traces.len()).collect::<Vec<_>>();
     let new_end = latencies.iter().sum::<Metrics>() / (frames.len() as u64);
     let mut new_root = Frame::new(
-        MetricsRange::new(Metrics::constant(0), new_end),
-        traces[0].root_frame().symbol.clone(),
+        MetricsRange::new(Metrics::constant(0), &new_end),
+        root_idx,
+        symbol_cache.get_ref(root_idx),
     );
 
     fill_annotations(
@@ -146,6 +151,7 @@ pub fn merge_traces(
         raw_trace_ids,
         &trace_indices,
         noise_context.as_ref(),
+        &mut symbol_cache,
         &mut lost_frame_occurences,
         FREQUENT_FRAME_THRESH,
     );
@@ -164,7 +170,7 @@ pub fn merge_traces(
         merged_events.push(lost_frame_event);
     }
 
-    Trace::new(new_root, merged_events)
+    Trace::new(symbol_cache.into_symbols(), new_root, merged_events)
 }
 
 trait Id: Clone {
@@ -444,7 +450,9 @@ fn fill_annotations(
     trace_indices: &[usize],
     noise_context: Option<&NoiseContext>,
 ) {
-    frame.annotations.insert(
+    // since `frame` should be newly created, we assume annotations is None
+    let mut annotations = IndexMap::new();
+    annotations.insert(
         ANNOTATION_COUNT_NAME.to_string(),
         Annotation::Uint64(latencies.len() as u64),
     );
@@ -464,9 +472,7 @@ fn fill_annotations(
     }
 
     if let Some(stats) = stats_annotation {
-        frame
-            .annotations
-            .insert(ANNOTATION_STATS_NAME.to_string(), Annotation::Map(stats));
+        annotations.insert(ANNOTATION_STATS_NAME.to_string(), Annotation::Map(stats));
     }
 
     if let Some(ids) = trace_ids {
@@ -479,11 +485,13 @@ fn fill_annotations(
         let raw_data_map = raw_data
             .into_iter()
             .collect::<IndexMap<String, Annotation>>();
-        frame.annotations.insert(
+        annotations.insert(
             ANNOTATION_RAW_DATA_NAME.to_string(),
             Annotation::Map(raw_data_map),
         );
     }
+
+    frame.annotations = Some(Box::new(annotations));
 }
 
 fn noise_contribution(
@@ -526,18 +534,21 @@ fn constrain_metrics(
     min_metrics: &Metrics,
     max_metrics: &Metrics,
 ) -> Option<MetricsRange> {
-    let mut result = target.clone();
-    result.start.ts = max(result.start.ts, min_metrics.ts);
-    result.start.cycles = max(result.start.cycles, min_metrics.cycles);
-    result.start.insn_count = max(result.start.insn_count, min_metrics.insn_count);
-    result.end.ts = min(result.end.ts, max_metrics.ts);
-    result.end.cycles = min(result.end.cycles, max_metrics.cycles);
-    result.end.insn_count = min(result.end.insn_count, max_metrics.insn_count);
-    if result.start.ts <= result.end.ts
-        && result.start.cycles <= result.end.cycles
-        && result.start.insn_count <= result.end.insn_count
+    let mut start = target.start;
+    start.ts = max(start.ts, min_metrics.ts);
+    start.cycles = max(start.cycles, min_metrics.cycles);
+    start.insn_count = max(start.insn_count, min_metrics.insn_count);
+
+    let mut end = target.end();
+    end.ts = min(end.ts, max_metrics.ts);
+    end.cycles = min(end.cycles, max_metrics.cycles);
+    end.insn_count = min(end.insn_count, max_metrics.insn_count);
+
+    if start.ts <= end.ts
+        && start.cycles <= end.cycles
+        && start.insn_count <= end.insn_count
     {
-        Some(result)
+        return Some(MetricsRange::new(start, &end));
     } else {
         None
     }
@@ -549,11 +560,12 @@ fn merge_children(
     raw_trace_ids: Option<&[&str]>, // parallel list to frames
     trace_indices: &[usize],        // parallel list to frames
     noise_context: Option<&NoiseContext>,
+    symbol_cache: &mut SymbolCache,
     lost_frame_occurrences: &mut Vec<Metrics>,
     frequent_thresh: f32,
 ) {
     let mut min_metrics = new_parent.metrics.start;
-    let max_metrics = new_parent.metrics.end;
+    let max_metrics = new_parent.metrics.end();
 
     let (n, indexed_children) = index_children(frames, raw_trace_ids, trace_indices);
     let mut sequences = indexed_children
@@ -572,15 +584,15 @@ fn merge_children(
 
         let latencies = children
             .iter()
-            .map(|f| f.metrics().end - f.metrics().start)
+            .map(|f| f.metrics().end() - f.metrics().start)
             .collect::<Vec<_>>();
         let new_end = new_start + latencies.iter().sum::<Metrics>() / (children.len() as u64);
 
-        let new_child_range = MetricsRange::new(new_start, new_end);
+        let new_child_range = MetricsRange::new(new_start, &new_end);
         if let Some(new_child_range) =
             constrain_metrics(&new_child_range, &min_metrics, &max_metrics)
         {
-            min_metrics = new_child_range.end;
+            min_metrics = new_child_range.end();
 
             match children.first().unwrap() {
                 IndexedChild::Frame(first_frame) => {
@@ -622,8 +634,11 @@ fn merge_children(
                         })
                         .collect::<Vec<&Frame>>();
 
-                    let mut merged_child =
-                        Frame::new(new_child_range, first_frame.original.symbol.clone());
+                    let symbol = (*first_frame.original.symbol).clone();
+                    let symbol_idx = symbol_cache.get_or_insert(symbol);
+                    let symbol_rc = symbol_cache.get_ref(symbol_idx);
+
+                    let mut merged_child = Frame::new(new_child_range, symbol_idx, symbol_rc);
                     let active_trace_ids_slice = active_trace_ids.as_ref().map(|v| v.as_slice());
                     merge_children(
                         &mut merged_child,
@@ -631,6 +646,7 @@ fn merge_children(
                         active_trace_ids_slice,
                         &active_trace_indices,
                         noise_context,
+                        symbol_cache,
                         lost_frame_occurrences,
                         frequent_thresh,
                     );
@@ -729,7 +745,7 @@ fn zip_events(
 }
 
 fn merge_events(traces: &[&Trace], new_range: &MetricsRange) -> Vec<Event> {
-    let new_range_len = new_range.end - new_range.start;
+    let new_range_len = new_range.end() - new_range.start;
     let mut events = Vec::new();
     let mut seen_ids = HashSet::new();
     for &trace in traces {
@@ -743,7 +759,7 @@ fn merge_events(traces: &[&Trace], new_range: &MetricsRange) -> Vec<Event> {
                         trace.events().iter().find_map(|e| {
                             if e.id == event.id {
                                 let trace_start = trace.root_frame().metrics.start;
-                                let trace_range = trace.root_frame().metrics.end - trace_start;
+                                let trace_range = trace.root_frame().metrics.end() - trace_start;
                                 // scale each occurence so it is within new_range
                                 Some(e.occurences().iter().map(move |o| {
                                     new_range_len * (o - &trace_start) / trace_range
