@@ -39,15 +39,18 @@ local installDeps = [
   'apt-get install -y --no-install-recommends ' + std.join(' ', aptPackages),
 ];
 
-// Rust toolchain version is pinned in rust-toolchain.toml at the repo root
-// (single source of truth). We bootstrap via rustup rather than the distro
-// rust package because Ubuntu 22.04 / Debian 12 don't ship a recent-enough
-// rustc for the pinned version (and edition 2024 requires >= 1.85 anyway).
+// Upstream (.github/workflows/release.yaml) installs Rust via
+// `dtolnay/rust-toolchain@stable`, i.e. it always tracks the current
+// `stable` channel rather than pinning a specific version — there is no
+// rust-toolchain.toml in this repo (removed upstream in favor of that
+// action). We mirror the same policy here so both pipelines build with
+// the same toolchain at any point in time: `--default-toolchain stable`
+// installs and activates the current stable release directly, no
+// separate `rustup show` step needed to trigger anything.
 //
-// `--default-toolchain none` skips downloading a placeholder toolchain at
-// rustup-init time; the subsequent `rustup show` reads rust-toolchain.toml
-// from the workspace and installs exactly that version with the minimal
-// profile — one toolchain download, not two.
+// We bootstrap via rustup rather than the distro rust package because
+// Ubuntu 22.04 / Debian 12 don't ship a recent-enough rustc for current
+// stable (and edition 2024 requires >= 1.85 anyway).
 //
 // Some Crow agent backends mount /root as a named volume, so a half-finished
 // rustup from a previous run can leave a stale /root/.rustup that confuses
@@ -60,10 +63,8 @@ local installDeps = [
 local installRust = [
   'rm -rf "$HOME/.rustup" "$HOME/.cargo"',
   "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs " +
-    '| sh -s -- -y --profile minimal --default-toolchain none --no-modify-path',
+    '| sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path',
   '. "$HOME/.cargo/env"',
-  // Triggers install of the toolchain pinned in rust-toolchain.toml.
-  'rustup show',
   'rustc --version',
   'cargo --version',
 ];
