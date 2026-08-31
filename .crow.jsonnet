@@ -160,7 +160,7 @@ local package_ = [
     // doesn't pull 4 different ubuntu/debian images just to repackage.
     {
       name: 'package-${TARGET}',
-      image: 'alpine:3.23',
+      image: 'alpine:3.24',
       when: [{ event: ['manual', 'tag'] }],
       commands: package_,
     },
